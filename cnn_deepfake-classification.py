@@ -5,8 +5,14 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import random
+import numpy as np
+import torchvision.transforms.v2 as T
+import seaborn as sns
+from PIL import Image, ImageEnhance
 from torch.utils.data import TensorDataset, DataLoader
 from os import listdir
+from sklearn.metrics import confusion_matrix
 
 folder_dir = "/home/davide/Documents/Deepfake-Classification/deepfake-classification"
 img_dir = "/home/davide/Documents/Deepfake-Classification/deepfake-classification/train"
@@ -19,6 +25,41 @@ csv_file = os.path.join(folder_dir, "train.csv")
 validation_file = os.path.join(folder_dir, "validation.csv")
 val_dir = "/home/davide/Documents/Deepfake-Classification/deepfake-classification/validation"
 
+df_train = pd.read_csv(csv_file)
+
+def augment_image(image):
+    image_pil = Image.fromarray(image)
+    
+    image_pil = image_pil.transpose(Image.FLIP_LEFT_RIGHT)
+    image_pil = image_pil.transpose(Image.FLIP_TOP_BOTTOM)
+
+    image_pil = image_pil.rotate(40)
+
+    enhancer = ImageEnhance.Brightness(image_pil)
+    image_pil = enhancer.enhance(1.185)
+    
+    image_pil = ImageEnhance.Color(image_pil).enhance(0.8)
+    image_pil = ImageEnhance.Sharpness(image_pil).enhance(0.968)
+
+    return np.array(image_pil)
+
+augmented_data = []
+print(f"Training set size: {len(df_train)}")
+for idx in range(len(df_train)):
+    row = df_train.iloc[idx]
+    img_path = os.path.join(img_dir, row['image_id'] + '.png')
+    image = cv2.imread(img_path)
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    image_resized = cv2.resize(image_rgb, (100, 100))
+    
+    augmented_image = augment_image(image_resized)
+    
+    normalized = cv2.normalize(augmented_image.astype('float32'), None, 0, 1, cv2.NORM_MINMAX)
+    tensor_image = torch.from_numpy(normalized).permute(2, 0, 1).float()
+    
+    augmented_data.append((tensor_image, row['label']))
+
+print(f"Finished generating augmented images")
 
 class NeuralNet(nn.Module):
     def __init__(self):
@@ -82,8 +123,6 @@ class NeuralNet(nn.Module):
     
 model = NeuralNet()
 
-df_train = pd.read_csv(csv_file)
-
 data = []
 for idx, row in df_train.iterrows():
     img_name = row['image_id'] + '.png'
@@ -91,7 +130,7 @@ for idx, row in df_train.iterrows():
     img_path = os.path.join(img_dir, img_name)
     image = cv2.imread(img_path)
 
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     # height, width, channels = image_rgb.shape
 
     # print(f"Original image width: {width} pixels")   100
@@ -104,17 +143,25 @@ for idx, row in df_train.iterrows():
 
     data.append((image_tensor, label))
 
+data += augmented_data
+print(f"Total training data size: {len(data)}")
+
 images = torch.stack([item[0] for item in data])
 labels = torch.tensor([item[1] for item in data])
 
 dataset = TensorDataset(images, labels)
 train_loader = DataLoader(dataset, batch_size=32, shuffle=True, num_workers=8)
 
+# optimizer = torch.optim.Adam(model.parameters(), lr=0.006, weight_decay=1e-5)
+# scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=5)
+
+# residual blocks and skip connection 
+
 optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.82, weight_decay=1e-4, nesterov=True)
 scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, base_lr=0.001, max_lr=0.01, step_size_up=2000)
 
-
-NUM_EPOCHS = 130
+# 186
+NUM_EPOCHS = 186
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Device: {device}")
 model = model.to(device) 
@@ -126,10 +173,11 @@ train_accuracies = []
 model.train(True)
 for epoch in range(NUM_EPOCHS): 
     print(f"=== Epoch {epoch+1} ===")
+    ####################
     running_loss = 0.0
     correct = 0
     total = 0
-
+    ###################
     for i, (inputs, labels) in enumerate(train_loader):
         inputs = inputs.to(device)
         labels = labels.to(device)
@@ -141,23 +189,28 @@ for epoch in range(NUM_EPOCHS):
         optimizer.step()
         scheduler.step()
 
+#####################################################
         running_loss += loss.item() * inputs.size(0)
         predicted = outputs.argmax(dim=1)
         correct += (predicted == labels).sum().item()
         total += labels.size(0)
+#####################################################
 
         if i % 100 == 0:
             print(f"Batch {i}, Loss: {loss.item():.4f}")
 
+##################################################################################
     epoch_loss = running_loss / total
     epoch_acc = correct / total
     train_losses.append(epoch_loss)
     train_accuracies.append(epoch_acc)
+    # scheduler.step(epoch_loss)
     print(f"Epoch {epoch+1} Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.4f}")
-    if epoch_acc > 0.995:
-        print(f"Stopping early at epoch {epoch+1} as accuracy is {epoch_acc: .4f}")
-        break
-print('Finished Training')
+    # if epoch_loss < 0.001:
+    #     print(f"Stopping early at epoch {epoch+1} as loss is {epoch_loss: .4f}")
+    #     break
+##################################################################################
+print('Finished training')
 epochs = range(1, len(train_losses) + 1)
 plt.figure(figsize=(10, 5))
 plt.plot(epochs, train_losses, 'b-', label='Training Loss')
@@ -167,7 +220,6 @@ plt.title('Training Loss and Accuracy')
 plt.legend()
 plt.show()
 
-
 df_test = pd.read_csv(test_file)
 
 test_data = []
@@ -176,7 +228,7 @@ for idx, row in df_test.iterrows():
     img_name = row['image_id'] + '.png'
     img_path = os.path.join(test_dir, img_name)
     image = cv2.imread(img_path)
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     image_resized = cv2.resize(image_rgb, (100, 100))
     
     normalized_image = cv2.normalize(image_resized.astype('float32'), None, 0, 1, cv2.NORM_MINMAX)
@@ -207,12 +259,14 @@ print("Predictions saved to prediction.csv")
 df_val = pd.read_csv(validation_file)
 
 val_data = []
+validation_predictions = []
+validation_correct_labels = []
 for idx, row in df_val.iterrows():
     img_name = row['image_id'] + '.png'
     label = row['label']
     img_path = os.path.join(val_dir, img_name)
     image = cv2.imread(img_path)
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     image_resized = cv2.resize(image_rgb, (100, 100))
     
     normalized_image = cv2.normalize(image_resized.astype('float32'), None, 0, 1, cv2.NORM_MINMAX)
@@ -234,10 +288,22 @@ with torch.no_grad():
         labels = labels.to(device)
         outputs = model(inputs)
         preds = outputs.argmax(dim=1)
+        validation_predictions.extend(preds.cpu().numpy())
+        validation_correct_labels.extend(labels.cpu().numpy())
         correct += (preds == labels).sum().item()
         total += labels.size(0)
 
 accuracy = correct / total
 print(f'Validation Accuracy: {accuracy*100:.2f}%')
+
+conf_matrix = confusion_matrix(validation_correct_labels, validation_predictions)
+print(f"Confusion Matrix:\n{conf_matrix}")
+
+plt.figure(figsize=(8,6))
+sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues')
+plt.xlabel('Predicted Label')
+plt.ylabel('True Label')
+plt.title('Confusion Matrix')
+plt.show()
 
 # 92.88%
